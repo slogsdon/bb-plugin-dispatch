@@ -12,7 +12,8 @@
     "branding": {
       "icon": "Send"
     },
-    "server": "./server.ts"
+    "server": "./server.ts",
+    "app": "./app.tsx"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",

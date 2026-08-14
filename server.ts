@@ -25,10 +25,33 @@ import { z } from "zod";
 
 const run = promisify(execFile);
 
+const intakeResult = z.object({
+  projectId: z.string().nullable(),
+  projectName: z.string().nullable(),
+  prompt: z.string(),
+  notes: z.array(z.string()),
+});
+
 export const rpcContract = defineRpcContract({
   projects: {
     input: z.null(),
     output: z.array(z.object({ id: z.string(), name: z.string() })),
+  },
+  preview: {
+    input: z.object({
+      request: z.string(),
+      projectId: z.string().nullable().optional(),
+      raw: z.boolean().optional(),
+    }),
+    output: intakeResult,
+  },
+  dispatch: {
+    input: z.object({
+      request: z.string(),
+      projectId: z.string().nullable().optional(),
+      raw: z.boolean().optional(),
+    }),
+    output: intakeResult.extend({ threadId: z.string() }),
   },
 });
 
@@ -104,6 +127,82 @@ async function defaultHostId(bb: BbPluginApi): Promise<string> {
   return connected.id;
 }
 
+
+type Intake = {
+  projectId: string | null;
+  projectName: string | null;
+  prompt: string;
+  notes: string[];
+};
+
+/** The whole intake pipeline: pick a project, expand the prompt. Shared by the
+ *  CLI and the nav panel so both degrade identically — there is one code path
+ *  that decides where work goes. */
+async function intake(
+  bb: BbPluginApi,
+  cfg: { litellmUrl: string; litellmKey: string; model: string; enhancerNote: string },
+  request: string,
+  opts: { projectId?: string | null; raw?: boolean },
+): Promise<Intake> {
+  const { litellmUrl: base, litellmKey: key, model } = cfg;
+  const res: any = await bb.sdk.projects.list({ includePersonal: true } as any);
+  const projects: Project[] = (res?.projects ?? res ?? []).map((p: any) => ({
+    id: p.id, name: p.name, path: p.sources?.[0]?.path ?? null,
+  }));
+
+  const notes: string[] = [];
+  let projectId: string | null = opts.projectId ?? null;
+  let prompt = request;
+
+  if (!key) notes.push("no LiteLLM key configured — intake skipped");
+
+  if (!projectId && key) {
+    try {
+      const raw = await complete(base, key, model, classifyPrompt(request, projects), true);
+      const parsed = JSON.parse(stripFence(raw));
+      if (projects.some((p) => p.id === parsed.projectId)) {
+        projectId = parsed.projectId;
+        notes.push(`classified: ${parsed.reason} (confidence ${parsed.confidence})`);
+        if (Number(parsed.confidence) < 0.5) notes.push("LOW CONFIDENCE — check the project before dispatching");
+      } else {
+        notes.push(`classifier returned an unknown id (${parsed.projectId}) — ignored`);
+      }
+    } catch (err) {
+      notes.push(`classification failed (${(err as Error).message}) — choose a project`);
+    }
+  }
+
+  if (!opts.raw && key) {
+    const template = await loadEnhancer(cfg.enhancerNote);
+    if (!template) {
+      notes.push("enhancer note unreadable (is Obsidian running?) — using the request as written");
+    } else {
+      try {
+        prompt = stripFence(await complete(base, key, model, template.replace("$ARGUMENTS", request), false));
+        notes.push("expanded via Prompt Enhancer");
+      } catch (err) {
+        notes.push(`expansion failed (${(err as Error).message}) — using the request as written`);
+      }
+    }
+  }
+
+  const target = projects.find((p) => p.id === projectId);
+  return { projectId, projectName: target?.name ?? null, prompt, notes };
+}
+
+async function spawnThread(bb: BbPluginApi, projectId: string, prompt: string): Promise<string> {
+  const spawned: any = await bb.sdk.threads.spawn({
+    projectId,
+    prompt,
+    environment: {
+      type: "host",
+      hostId: await defaultHostId(bb),
+      workspace: { type: "unmanaged", path: null },
+    },
+  } as any);
+  return spawned?.thread?.id ?? spawned?.id ?? "";
+}
+
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     litellmUrl: { type: "string", label: "LiteLLM base URL", default: "http://localhost:4000/v1" },
@@ -112,11 +211,29 @@ export default async function plugin(bb: BbPluginApi) {
     enhancerNote: { type: "string", label: "Prompt Enhancer note", default: "Prompt Enhancer" },
   });
 
+  const readCfg = async () => {
+    const c = await settings.get();
+    return {
+      litellmUrl: String(c.litellmUrl),
+      litellmKey: String(c.litellmKey ?? ""),
+      model: String(c.model),
+      enhancerNote: String(c.enhancerNote),
+    };
+  };
+
   bb.rpc.register(rpcContract, {
     projects: async () => {
       const res: any = await bb.sdk.projects.list({ includePersonal: true } as any);
       const rows: Project[] = res?.projects ?? res ?? [];
       return rows.map((p) => ({ id: p.id, name: p.name }));
+    },
+    preview: async ({ request, projectId, raw }) =>
+      intake(bb, await readCfg(), request, { projectId, raw }),
+    dispatch: async ({ request, projectId, raw }) => {
+      const result = await intake(bb, await readCfg(), request, { projectId, raw });
+      if (!result.projectId) throw new Error("no project resolved — choose one");
+      const threadId = await spawnThread(bb, result.projectId, result.prompt);
+      return { ...result, threadId };
     },
   });
 
@@ -138,15 +255,12 @@ export default async function plugin(bb: BbPluginApi) {
       },
     ],
     async run(argv) {
-      // Tolerate a leading verb so `bb dispatch preview "..."` and
-      // `bb dispatch "..."` behave the same.
       if (argv[0] === "preview" || argv[0] === "go") {
         if (argv[0] === "go") argv = [...argv.slice(1), "--go"];
         else argv = argv.slice(1);
       }
       const flags = new Set(argv.filter((a) => a.startsWith("--")));
       const projectIdx = argv.indexOf("--project");
-      const forcedProject = projectIdx >= 0 ? argv[projectIdx + 1] : undefined;
       // Guard the index: with no --project, projectIdx is -1 and projectIdx + 1
       // is 0, which would silently swallow the first token of the request.
       const valueIdx = projectIdx >= 0 ? projectIdx + 1 : -1;
@@ -156,86 +270,27 @@ export default async function plugin(bb: BbPluginApi) {
         .trim();
       if (!request) return { exitCode: 1, stderr: 'usage: bb dispatch "<request>" [--project <id>] [--raw] [--go]' };
 
-      const cfg = await settings.get();
-      const base = String(cfg.litellmUrl);
-      const key = String(cfg.litellmKey ?? "");
-      const model = String(cfg.model);
-
-      const res: any = await bb.sdk.projects.list({ includePersonal: true } as any);
-      const projects: Project[] = (res?.projects ?? res ?? []).map((p: any) => ({
-        id: p.id, name: p.name, path: p.sources?.[0]?.path ?? null,
-      }));
-
-      const notes: string[] = [];
-      let projectId = forcedProject;
-      let prompt = request;
-
-      // Intake is best-effort. When LiteLLM or the vault is unavailable the
-      // fallback is exactly what bb does natively: the raw text, to a project
-      // named explicitly. Degraded, never silently wrong.
-      if (!key) notes.push("no LiteLLM key configured — intake skipped");
-
-      if (!projectId && key) {
-        try {
-          const raw = await complete(base, key, model, classifyPrompt(request, projects), true);
-          const parsed = JSON.parse(stripFence(raw));
-          if (projects.some((p) => p.id === parsed.projectId)) {
-            projectId = parsed.projectId;
-            notes.push(`classified: ${parsed.reason} (confidence ${parsed.confidence})`);
-            if (Number(parsed.confidence) < 0.5) notes.push("LOW CONFIDENCE — check the project before --go");
-          } else {
-            notes.push(`classifier returned an unknown id (${parsed.projectId}) — ignored`);
-          }
-        } catch (err) {
-          notes.push(`classification failed (${(err as Error).message}) — pass --project`);
-        }
-      }
-
-      if (!flags.has("--raw") && key) {
-        const template = await loadEnhancer(String(cfg.enhancerNote));
-        if (!template) {
-          notes.push("enhancer note unreadable (is Obsidian running?) — using the request as written");
-        } else {
-          try {
-            prompt = stripFence(await complete(base, key, model, template.replace("$ARGUMENTS", request), false));
-            notes.push("expanded via Prompt Enhancer");
-          } catch (err) {
-            notes.push(`expansion failed (${(err as Error).message}) — using the request as written`);
-          }
-        }
-      }
-
-      const target = projects.find((p) => p.id === projectId);
+      const result = await intake(bb, await readCfg(), request, {
+        projectId: projectIdx >= 0 ? argv[valueIdx] : null,
+        raw: flags.has("--raw"),
+      });
       const header = [
         `request:  ${request}`,
-        `project:  ${target ? `${target.name} (${target.id})` : "UNRESOLVED — pass --project"}`,
-        ...notes.map((n) => `note:     ${n}`),
+        `project:  ${result.projectName ? `${result.projectName} (${result.projectId})` : "UNRESOLVED — pass --project"}`,
+        ...result.notes.map((n) => `note:     ${n}`),
         "",
         "prompt:",
-        prompt,
+        result.prompt,
       ].join("\n");
 
       if (!flags.has("--go")) {
         return { exitCode: 0, stdout: `${header}\n\n(preview — re-run with --go to spawn)` };
       }
-      if (!projectId) {
+      if (!result.projectId) {
         return { exitCode: 1, stdout: header, stderr: "\nno project resolved; pass --project <id>" };
       }
-      // `environment` is required by createThreadRequestSchema — omitting it
-      // fails with a bare "HTTP 400: Required". `host` + `unmanaged` with a null
-      // path means "the project's own checkout on the default machine", which is
-      // what dispatch wants: work in the repo, not an isolated worktree.
-      const spawned: any = await bb.sdk.threads.spawn({
-        projectId,
-        prompt,
-        environment: {
-          type: "host",
-          hostId: await defaultHostId(bb),
-          workspace: { type: "unmanaged", path: null },
-        },
-      } as any);
-      const id = spawned?.thread?.id ?? spawned?.id ?? "(unknown)";
-      return { exitCode: 0, stdout: `${header}\n\nspawned: ${id}` };
+      const threadId = await spawnThread(bb, result.projectId, result.prompt);
+      return { exitCode: 0, stdout: `${header}\n\nspawned: ${threadId}` };
     },
   });
 
