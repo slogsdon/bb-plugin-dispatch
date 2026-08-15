@@ -19,11 +19,17 @@
 // two-step invocation is the confirmation, since project classification from a
 // one-liner will sometimes be wrong.
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
-import { execFile } from "node:child_process";
+import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import { z } from "zod";
 
-const run = promisify(execFile);
+const execShell = promisify(exec);
+
+const enhancerConfig = z.object({
+  source: z.enum(["text", "command"]),
+  text: z.string(),
+  command: z.string(),
+});
 
 const intakeResult = z.object({
   projectId: z.string().nullable(),
@@ -53,22 +59,81 @@ export const rpcContract = defineRpcContract({
     }),
     output: intakeResult.extend({ threadId: z.string() }),
   },
+  getEnhancer: { input: z.null(), output: enhancerConfig },
+  setEnhancer: { input: enhancerConfig, output: enhancerConfig },
 });
 
 type Project = { id: string; name: string; path?: string | null };
 
-/** The enhancer lives in the vault. Read it through the CLI — never by path;
- *  vault files are off-limits to direct reads by standing rule. */
-async function loadEnhancer(note: string): Promise<string | null> {
-  try {
-    const { stdout } = await run("obsidian", ["read", `file=${note}`], { timeout: 20_000 });
-    // The note wraps the template in ~~~ fences; take what is between them.
-    const fenced = stdout.match(/~~~\s*\n([\s\S]*?)\n~~~/);
-    const body = (fenced ? fenced[1] : stdout).trim();
-    return body.includes("$ARGUMENTS") ? body : null;
-  } catch {
-    return null;
+/** Bundled default so a fresh install works with no vault, no proxy, no setup.
+ *  Generalised from Shane's "Prompt Enhancer" note. $ARGUMENTS is replaced with
+ *  the request. */
+const DEFAULT_ENHANCER = `You are a prompt engineer with one job: take the prompt provided and return a significantly upgraded version of it.
+
+Diagnose it first (internally, do not output this):
+- Is the goal vague or ambiguous?
+- Is it over-specified and brittle?
+- Does it expect a one-shot answer when iteration would serve better?
+- Is there no mechanism for self-critique or quality checking?
+- Is state/context missing that the model would need to not restart from scratch?
+
+Then apply only the fixes that are warranted:
+
+1. SHARPEN THE GOAL — make it concrete, specific, and testable. Add success criteria if absent.
+2. INJECT STATE STRUCTURE — add explicit tracking of goal, constraints, and known context where relevant.
+3. BUILD IN ITERATION — replace one-shot answer expectations with plan -> act -> evaluate -> next step framing where appropriate.
+4. ADD A CRITIC LAYER — instruct the model to find failure points and fix them before presenting output.
+5. DECOMPOSE ROLES if the task is complex — Architect / Builder / Auditor. Skip this for simple, single-domain prompts.
+
+Hard rules:
+- Do NOT change the fundamental intent of the original prompt
+- Do NOT add length that doesn't add precision
+- Do NOT apply patterns that don't fit — not every prompt needs all five fixes
+- Strip anything vague or redundant from the original
+
+Output only the upgraded prompt inside a code block, ready to use.
+
+Prompt to upgrade:
+$ARGUMENTS`;
+
+type EnhancerConfig = { source: "text" | "command"; text: string; command: string };
+const ENHANCER_KEY = "enhancer";
+const DEFAULT_ENHANCER_CONFIG: EnhancerConfig = {
+  source: "text",
+  text: DEFAULT_ENHANCER,
+  command: "",
+};
+
+
+/** Resolve the enhancer template from configuration.
+ *
+ *  Two sources. "text" is a literal template edited in the Dispatch panel and is
+ *  the default, so a fresh install works with no vault and no external tooling.
+ *  "command" shells out and uses stdout, which is how a template that already
+ *  lives somewhere else gets reused rather than copied — e.g.
+ *  `obsidian read path="Prompts/Enhancer.md"`.
+ *
+ *  The command runs through a shell because it is a user-authored command line.
+ *  That is the same trust level as the rest of the plugin (full-trust code on
+ *  your own machine), but it is worth knowing it is not sandboxed.
+ *
+ *  Either way the template must contain $ARGUMENTS; without it there is nowhere
+ *  to put the request, so expansion is skipped rather than sending a malformed
+ *  prompt. */
+async function loadEnhancer(cfg: EnhancerConfig): Promise<string | null> {
+  let body = cfg.text;
+  if (cfg.source === "command") {
+    if (!cfg.command.trim()) return null;
+    try {
+      const { stdout } = await execShell(cfg.command, { timeout: 20_000 });
+      // Tolerate a fenced template: some notes wrap the prompt in ~~~ or ```.
+      const fenced = stdout.match(/(?:~~~|```)[a-z]*\s*\n([\s\S]*?)\n(?:~~~|```)/);
+      body = (fenced ? fenced[1] : stdout).trim();
+    } catch {
+      return null;
+    }
   }
+  return body.includes("$ARGUMENTS") ? body : null;
 }
 
 async function complete(
@@ -140,7 +205,7 @@ type Intake = {
  *  that decides where work goes. */
 async function intake(
   bb: BbPluginApi,
-  cfg: { litellmUrl: string; litellmKey: string; model: string; enhancerNote: string },
+  cfg: { litellmUrl: string; litellmKey: string; model: string },
   request: string,
   opts: { projectId?: string | null; raw?: boolean },
 ): Promise<Intake> {
@@ -173,9 +238,10 @@ async function intake(
   }
 
   if (!opts.raw && key) {
-    const template = await loadEnhancer(cfg.enhancerNote);
+    const stored = (await bb.storage.kv.get<EnhancerConfig>(ENHANCER_KEY)) ?? DEFAULT_ENHANCER_CONFIG;
+    const template = await loadEnhancer(stored);
     if (!template) {
-      notes.push("enhancer note unreadable (is Obsidian running?) — using the request as written");
+      notes.push("enhancer unavailable (command failed, or template has no $ARGUMENTS) — using the request as written");
     } else {
       try {
         prompt = stripFence(await complete(base, key, model, template.replace("$ARGUMENTS", request), false));
@@ -208,7 +274,6 @@ export default async function plugin(bb: BbPluginApi) {
     litellmUrl: { type: "string", label: "LiteLLM base URL", default: "http://localhost:4000/v1" },
     litellmKey: { type: "string", label: "LiteLLM master key", secret: true },
     model: { type: "string", label: "Intake model (alias)", default: "bulk-primary" },
-    enhancerNote: { type: "string", label: "Prompt Enhancer note", default: "Prompt Enhancer" },
   });
 
   const readCfg = async () => {
@@ -217,7 +282,6 @@ export default async function plugin(bb: BbPluginApi) {
       litellmUrl: String(c.litellmUrl),
       litellmKey: String(c.litellmKey ?? ""),
       model: String(c.model),
-      enhancerNote: String(c.enhancerNote),
     };
   };
 
@@ -229,6 +293,12 @@ export default async function plugin(bb: BbPluginApi) {
     },
     preview: async ({ request, projectId, raw }) =>
       intake(bb, await readCfg(), request, { projectId, raw }),
+    getEnhancer: async () =>
+      (await bb.storage.kv.get<EnhancerConfig>(ENHANCER_KEY)) ?? DEFAULT_ENHANCER_CONFIG,
+    setEnhancer: async (next) => {
+      await bb.storage.kv.set(ENHANCER_KEY, next);
+      return next;
+    },
     dispatch: async ({ request, projectId, raw }) => {
       const result = await intake(bb, await readCfg(), request, { projectId, raw });
       if (!result.projectId) throw new Error("no project resolved — choose one");

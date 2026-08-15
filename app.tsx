@@ -13,6 +13,7 @@ import { definePluginApp, useBbNavigate, useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 
 type Project = { id: string; name: string };
+type Enhancer = { source: "text" | "command"; text: string; command: string };
 type Intake = {
   projectId: string | null;
   projectName: string | null;
@@ -30,9 +31,19 @@ function DispatchPanel() {
   const [result, setResult] = useState<Intake | null>(null);
   const [busy, setBusy] = useState<"" | "preview" | "dispatch">("");
   const [error, setError] = useState<string | null>(null);
+  const [enhancer, setEnhancer] = useState<Enhancer | null>(null);
+  const [showEnhancer, setShowEnhancer] = useState(false);
+  const [saved, setSaved] = useState(false);
 
   useEffect(() => {
     rpc.call("projects").then((p) => setProjects(p as Project[])).catch(() => {});
+    rpc.call("getEnhancer").then((e) => setEnhancer(e as Enhancer)).catch(() => {});
+  }, [rpc]);
+
+  const saveEnhancer = useCallback((next: Enhancer) => {
+    setEnhancer(next);
+    setSaved(false);
+    rpc.call("setEnhancer", next).then(() => setSaved(true)).catch((e: Error) => setError(e.message));
   }, [rpc]);
 
   const args = { request, projectId: projectId || null, raw };
@@ -95,6 +106,67 @@ function DispatchPanel() {
           </button>
         </div>
       </div>
+
+      <div>
+        <button
+          onClick={() => setShowEnhancer((v) => !v)}
+          className="text-xs text-muted-foreground underline-offset-2 hover:underline"
+        >
+          {showEnhancer ? "Hide" : "Edit"} prompt enhancer
+        </button>
+      </div>
+
+      {showEnhancer && enhancer ? (
+        <div className="space-y-3 rounded-lg border p-4">
+          <div className="flex items-center gap-3 text-sm">
+            <label className="text-muted-foreground">Source</label>
+            <select
+              value={enhancer.source}
+              onChange={(e) => saveEnhancer({ ...enhancer, source: e.target.value as Enhancer["source"] })}
+              className="rounded-md border bg-background px-2 py-1.5 text-sm"
+            >
+              <option value="text">Text</option>
+              <option value="command">Command</option>
+            </select>
+            {saved ? <span className="text-xs text-muted-foreground">saved</span> : null}
+          </div>
+
+          {enhancer.source === "text" ? (
+            <>
+              <textarea
+                value={enhancer.text}
+                onChange={(e) => setEnhancer({ ...enhancer, text: e.target.value })}
+                onBlur={() => saveEnhancer(enhancer)}
+                rows={14}
+                spellCheck={false}
+                className="w-full resize-y rounded-md border bg-background p-3 font-mono text-xs outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              />
+              <p className="text-xs text-muted-foreground">
+                Must contain <code>$ARGUMENTS</code>, which is replaced with your request.
+                Without it, expansion is skipped.
+              </p>
+            </>
+          ) : (
+            <>
+              <input
+                value={enhancer.command}
+                onChange={(e) => setEnhancer({ ...enhancer, command: e.target.value })}
+                onBlur={() => saveEnhancer(enhancer)}
+                placeholder={'obsidian read path="Prompts/Enhancer.md"'}
+                spellCheck={false}
+                className="w-full rounded-md border bg-background px-3 py-2 font-mono text-xs outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              />
+              <p className="text-xs text-muted-foreground">
+                Shell command whose stdout is the template — use this to keep the prompt
+                where it already lives instead of copying it. Example:{" "}
+                <code>obsidian read path="Prompts/Enhancer.md"</code>. Fenced output
+                (<code>~~~</code> or <code>```</code>) is unwrapped. Must contain{" "}
+                <code>$ARGUMENTS</code>.
+              </p>
+            </>
+          )}
+        </div>
+      ) : null}
 
       {error ? <p className="text-sm text-destructive">{error}</p> : null}
 

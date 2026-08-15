@@ -20,9 +20,7 @@ you into the new thread.
 
 1. **Classify** — asks a model which of your registered bb projects the request
    belongs to, and reports its own confidence.
-2. **Expand** — runs the request through your `Prompt Enhancer` vault note,
-   read live through the `obsidian` CLI. Editing that note changes dispatch;
-   there is no copy of it here.
+2. **Expand** — runs the request through the prompt enhancer (see below).
 3. **Spawn** — `sdk.threads.spawn()` into the chosen project, which inherits
    that project's remembered provider/model defaults.
 
@@ -57,7 +55,7 @@ project you name:
 | Failure | Effect |
 |---|---|
 | LiteLLM unreachable or key unset | no classification, no expansion — pass `--project` |
-| Obsidian not running | no expansion; request used as written |
+| Enhancer command fails, or template lacks `$ARGUMENTS` | no expansion; request used as written |
 | Classifier returns an unknown project id | ignored; pass `--project` |
 
 **Threads run in the project checkout, not an isolated worktree.**
@@ -76,10 +74,27 @@ interactive channel, so the preview/`--go` two-step *is* the confirmation.
 | `litellmUrl` | `http://localhost:4000/v1` | OpenAI-compatible base URL |
 | `litellmKey` | — | secret; required for any intake |
 | `model` | `bulk-primary` | alias to classify and expand with |
-| `enhancerNote` | `Prompt Enhancer` | vault note holding the expander |
 
-The enhancer note must contain `$ARGUMENTS`, which is replaced with the request.
-If it does not, expansion is skipped rather than sending a malformed prompt.
+The enhancer is configured in the **Dispatch** panel rather than here, because bb
+settings support only single-line strings and the template is long.
+
+## Prompt enhancer
+
+Two sources, chosen from a dropdown in the panel:
+
+- **Text** (default) — a template edited in a textarea. Ships with a working
+  default, so a fresh install needs no vault and no external tooling.
+- **Command** — a shell command whose stdout is the template. Use this to keep
+  the prompt where it already lives instead of copying it:
+  `obsidian read path="Prompts/Enhancer.md"`. Fenced output (` ``` ` or `~~~`)
+  is unwrapped automatically.
+
+Either way the template must contain `$ARGUMENTS`, which is replaced with the
+request. Without it, expansion is skipped rather than sending a malformed
+prompt.
+
+Command mode runs through a shell. That is the same trust level as the rest of
+the plugin — full-trust code on your own machine — but it is not sandboxed.
 
 Reload after changing settings: `bb plugin reload dispatch`.
 
