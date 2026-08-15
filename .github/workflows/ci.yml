@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      # bb downloads its build toolchain on first use. Without this the two
+      # toolchain fetches below dominate the run.
+      - name: Cache bb build toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.bb/plugins/toolchain-*
+          key: bb-toolchain-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: bb-toolchain-${{ runner.os }}-
+
+      # Regenerated rather than trusted from the checkout: these declarations
+      # come from the pinned bb-app in devDependencies, so a committed copy that
+      # has gone stale against it would typecheck green and still be wrong.
+      # `bb plugin types` and `bb plugin build` both run without a bb server
+      # (verified against a dead BB_SERVER_URL), which is what makes this
+      # possible on a runner at all.
+      - name: Generate SDK declarations
+        run: npm run types
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # The real gate. `bb plugin build` is what a managed install runs, so a
+      # green typecheck with a failing build is exactly the state that strands
+      # users on `bb plugin install`.
+      - name: Build
+        run: npm run build
+
+      - name: Verify build artifacts
+        run: |
+          set -euo pipefail
+          test -s dist/server.js
+          test -s dist/server.meta.json
+          # Frontend artifacts only when the manifest declares an app entry.
+          if node -e "process.exit(require('./package.json').bb.app ? 0 : 1)"; then
+            test -s dist/app.js
+            test -s dist/app.meta.json
+          fi
+          echo "artifacts present"
