@@ -357,6 +357,30 @@ async function spawnThread(bb: BbPluginApi, projectId: string, prompt: string): 
   return spawned?.thread?.id ?? spawned?.id ?? "";
 }
 
+
+type DiscoveredRepo = {
+  name: string;
+  path: string;
+  originUrl?: string | null;
+  lastActivityAt?: string | null;
+  agentSeen?: boolean;
+};
+
+/** Repos bb has found on this host, registered or not.
+ *
+ *  bb computes this for first-run onboarding; it is equally the answer to "what
+ *  could I be dispatching to that I have not told bb about". `agentSeen` is the
+ *  useful ranking signal — a repo an agent has already worked in is far likelier
+ *  to want dispatching than a dormant clone.
+ *
+ *  Host-only: nothing here reaches GitHub for repos that are not cloned, and
+ *  those would not be dispatchable anyway since bb needs a local checkout. */
+async function discoverRepos(bb: BbPluginApi): Promise<DiscoveredRepo[]> {
+  const res: any = await bb.sdk.system.onboardingRepos();
+  return (res?.repos ?? res ?? []) as DiscoveredRepo[];
+}
+
+
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     litellmUrl: { type: "string", label: "LiteLLM base URL", default: "http://localhost:4000/v1" },
@@ -427,6 +451,11 @@ export default async function plugin(bb: BbPluginApi) {
         usage: 'bb dispatch "fix the flaky auth test"',
       },
       {
+        name: "projects",
+        summary: "List host repos that are not bb projects, and register them",
+        usage: "bb dispatch projects [--register <name,name|all>]",
+      },
+      {
         name: "enhancer",
         summary: "Show or set the prompt enhancer (the panel's editor, headless)",
         usage: 'bb dispatch enhancer [--command \'obsidian read path="X.md"\' | --source text]',
@@ -441,6 +470,69 @@ export default async function plugin(bb: BbPluginApi) {
       // `enhancer` configures what the panel's editor edits. The template lives
       // in kv rather than plugin settings (bb settings have no multiline type),
       // so without this there is no way to set it on a headless machine.
+      // `projects` surfaces repos bb has discovered on this host that are not
+      // registered projects. Dispatch can only route to registered projects, so
+      // an unregistered repo is invisible to the classifier — it will confidently
+      // pick the nearest registered project instead. This is the discovery half
+      // of routing fidelity, distinct from classifying among what already exists.
+      if (argv[0] === "projects") {
+        const rest = argv.slice(1);
+        const regIdx = rest.indexOf("--register");
+        const discovered = await discoverRepos(bb);
+        const res: any = await bb.sdk.projects.list({ includePersonal: true } as any);
+        const rows: any[] = res?.projects ?? res ?? [];
+        const known = new Set<string>();
+        for (const p of rows) for (const src of p.sources ?? []) if (src?.path) known.add(src.path);
+        const missing = discovered.filter((r) => !known.has(r.path));
+
+        if (regIdx < 0) {
+          if (!missing.length) return { exitCode: 0, stdout: "every discovered repo is already a project" };
+          const lines = missing.map((r) => {
+            const seen = r.agentSeen ? "  agent seen" : "";
+            // lastActivityAt is an ISO string, not epoch millis — Number() on it
+            // yields NaN and toISOString then throws "Invalid time value".
+            const parsed = r.lastActivityAt ? new Date(r.lastActivityAt) : null;
+            const when =
+              parsed && !Number.isNaN(parsed.getTime())
+                ? parsed.toISOString().slice(0, 10)
+                : "?";
+            return `  ${r.name.padEnd(28)} ${r.path.replace(process.env.HOME ?? "", "~")}  (${when})${seen}`;
+          });
+          return {
+            exitCode: 0,
+            stdout:
+              `${missing.length} repo(s) on this host are not bb projects:\n${lines.join("\n")}\n\n` +
+              `register with: bb dispatch projects --register <name>[,<name>...]  (or --register all)`,
+          };
+        }
+
+        const wanted = (rest[regIdx + 1] ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+        if (!wanted.length) return { exitCode: 1, stderr: "--register needs a comma-separated list, or 'all'" };
+        const pick = wanted.includes("all")
+          ? missing
+          : missing.filter((r) => wanted.includes(r.name) || wanted.includes(r.path));
+        if (!pick.length) return { exitCode: 1, stderr: "nothing matched; run without --register to list" };
+
+        const hostId = await defaultHostId(bb);
+        const done: string[] = [];
+        for (const r of pick) {
+          try {
+            // createProjectRequestSchema nests the location: { name, source: { hostId,
+            // type: "local_path", path } }. A flat {name, path, hostId} fails with a
+            // bare "HTTP 400: Required".
+            await bb.sdk.projects.create({
+              name: r.name,
+              source: { hostId, type: "local_path", path: r.path },
+            } as any);
+            done.push(`registered ${r.name}`);
+          } catch (err) {
+            done.push(`FAILED ${r.name}: ${(err as Error).message}`);
+          }
+        }
+        const failed = done.some((d) => d.startsWith("FAILED"));
+        return { exitCode: failed ? 1 : 0, stdout: done.join("\n") };
+      }
+
       if (argv[0] === "enhancer") {
         const rest = argv.slice(1);
         const current =

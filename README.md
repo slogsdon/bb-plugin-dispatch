@@ -48,7 +48,27 @@ hidden threads.
 
 ## Limitations
 
-**It can only route to registered bb projects.** The classifier picks from
+**It can only route to registered bb projects** — but it can tell you what is
+missing. `bb dispatch projects` lists repos bb has discovered on this host that
+are not registered, ranked with last activity and whether an agent has already
+worked there:
+
+```bash
+bb dispatch projects                          # list the gap
+bb dispatch projects --register relay,agenda-sync
+bb dispatch projects --register all
+```
+
+This is the discovery half of routing fidelity, and it matters more than the
+classifier. Two requests that misrouted at 0.4 and 0.85 confidence both went to
+the correct project at 1.0 once the repos they referred to were registered — the
+classifier had been picking the nearest available project because the right one
+did not exist.
+
+Nothing here reaches GitHub for repos you have not cloned; those are not
+dispatchable anyway, since bb needs a local checkout.
+
+**Unregistered work is invisible.** The classifier picks from
 `sdk.projects.list()`. Work that lives in a directory bb does not know about is
 invisible to it, and the classifier will confidently pick the nearest registered
 project instead. If dispatch keeps choosing the wrong target, check whether the
