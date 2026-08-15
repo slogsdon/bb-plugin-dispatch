@@ -2,6 +2,27 @@
   "name": "bb-plugin-dispatch",
   "version": "0.1.0",
   "type": "module",
+  "description": "A bb plugin that turns a one-liner into a scoped thread in the right project: it classifies which of your bb projects the request belongs to, expands it through a prompt enhancer, and spawns the thread.",
+  "keywords": [
+    "bb",
+    "bb-plugin",
+    "getbb",
+    "agent-ide",
+    "ai-agents",
+    "prompt-engineering",
+    "prompt-expansion",
+    "task-routing"
+  ],
+  "author": "Shane Logsdon",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/slogsdon/bb-plugin-dispatch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/slogsdon/bb-plugin-dispatch/issues"
+  },
+  "homepage": "https://github.com/slogsdon/bb-plugin-dispatch#readme",
+  "license": "MIT",
   "engines": {
     "bb": ">=0.37",
     "bbPluginSdk": "^0.4.1"

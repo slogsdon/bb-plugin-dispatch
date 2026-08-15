@@ -89,9 +89,8 @@ export const rpcContract = defineRpcContract({
 
 type Project = { id: string; name: string; path?: string | null };
 
-/** Bundled default so a fresh install works with no vault, no proxy, no setup.
- *  Generalised from Shane's "Prompt Enhancer" note. $ARGUMENTS is replaced with
- *  the request. */
+/** Bundled default so a fresh install works with no vault and no setup.
+ *  $ARGUMENTS is replaced with the request. */
 const DEFAULT_ENHANCER = `You are a prompt engineer with one job: take the prompt provided and return a significantly upgraded version of it.
 
 Diagnose it first (internally, do not output this):
