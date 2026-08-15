@@ -24,40 +24,22 @@ you into the new thread.
 3. **Spawn** — `sdk.threads.spawn()` into the chosen project, which inherits
    that project's remembered provider/model defaults.
 
-## Intake modes
-
-Plugins cannot reach bb's internal inference (`PluginHosts` exposes only port and
-tunnel methods), so intake needs its own way to call a model. Two, by setting:
-
-**`thread`** (default) — spawns a hidden bb thread on the **intake lane** (see
-below), waits, reads the output, archives it. Portable: works for any bb user
-with any provider, no proxy and no API key. Slower — a spawn plus a turn rather
-than one request — and an agent has tools and a personality, so the prompts
-forbid both and parsing is tolerant.
-
-**`http`** — one call to an OpenAI-compatible proxy. Fast, but assumes you run
-one. Set `litellmUrl`, `litellmKey`, and `model`.
-
-If you already run LiteLLM, note that `pi` exposes its aliases to bb's model
-selector (`litellm/bulk-primary` and friends), so thread mode reaches the same
-lane without the plugin knowing anything about the proxy.
-
-Intake threads are **archived, not deleted** — bb refuses destructive actions
-without an interactive confirmation, so deleting them fails silently and leaks
-hidden threads.
-
 ## The intake lane
 
-Project, provider, model, reasoning, permission mode, and environment for thread
-intake are picked with **bb's own new-thread composer**, rendered in Settings →
-Plugins → Dispatch. Submitting saves the selections; the prompt you type is
-discarded and no thread is started.
+Plugins cannot reach bb's internal inference (`PluginHosts` exposes only port and
+tunnel methods), so intake calls a model the only way a plugin can: it spawns a
+hidden bb thread, waits, reads the output, and archives it. That thread runs on
+the **intake lane** — one saved set of selections covering project, provider,
+model, reasoning level, permission mode, and environment.
 
-This is not a settings page in disguise, it is the only correct way to do it:
+Pick it with **bb's own new-thread composer**, in Settings → Plugins → Dispatch.
+Submitting saves the selections; the prompt you type is discarded and no thread
+is started.
 
-- `pi` alone publishes 373 models, so a `select` descriptor would have been worse
-  than the free-text pair it replaces, and the composer is the only host-owned
-  picker the SDK exports.
+Why a composer and not settings fields:
+
+- `pi` alone publishes 373 models, so a `select` descriptor would be worse than
+  free text, and the composer is the only host-owned picker the SDK exports.
 - The composer marks every selection **caller-explicit** in
   `executionInputSources`, and the whole request is stored and spread back into
   `threads.spawn` verbatim. That is load-bearing: the server drops a requested
@@ -67,7 +49,8 @@ This is not a settings page in disguise, it is the only correct way to do it:
 
 The lane lives in plugin kv rather than in settings, because a plugin can read
 its settings but not write them — the same reason the enhancer template lives
-there.
+there. The plugin declares **no settings at all**; the composer is the whole
+configuration surface.
 
 Headless equivalent, for a machine with no UI:
 
@@ -75,6 +58,26 @@ Headless equivalent, for a machine with no UI:
 bb dispatch lane                          # show current
 bb dispatch lane --provider pi --model litellm/bulk-primary --project proj_abc123
 ```
+
+Intake threads are **archived, not deleted** — bb refuses destructive actions
+without an interactive confirmation, so deleting them fails silently and leaks
+hidden threads.
+
+### One path, not two
+
+An earlier version could also POST to an OpenAI-compatible proxy instead of
+spawning a thread. It was faster, and it could *force* JSON through
+`response_format` where an agent can only be asked. It was still removed: it only
+ran on a machine with LiteLLM in front of it, so it was a second code path most
+installs could never take, and it cost four settings descriptors to configure.
+
+The thread path's weaknesses are therefore accepted rather than routed around. An
+agent has tools and a personality, so the prompts forbid both and parsing is
+tolerant of narration. Intake is a spawn plus a turn, not one request.
+
+If you do run LiteLLM, none of that is a loss — `pi` exposes its aliases to bb's
+model selector (`litellm/bulk-primary` and friends), so the lane reaches exactly
+the same proxy without the plugin knowing it exists.
 
 The CLI form synthesises the provenance and a default host environment, since a
 shell has no picker to resolve them from. It marks only `providerId` and `model`
@@ -125,7 +128,7 @@ project you name:
 
 | Failure | Effect |
 |---|---|
-| Intake unconfigured or unreachable | no classification, no expansion — pass `--project` |
+| No intake lane set, or its thread errors | no classification, no expansion — pass `--project` |
 | Enhancer command fails, or template lacks `$ARGUMENTS` | no expansion; request used as written |
 | Classifier returns an unknown project id | ignored; pass `--project` |
 
@@ -138,19 +141,16 @@ interactive channel, so the preview/`--go` two-step *is* the confirmation.
 
 ## Settings
 
-`bb plugin config dispatch set <key> <value>`
+There are none — `bb plugin config dispatch` reports "This plugin declares no
+settings." Both things that need configuring outgrew what a settings descriptor
+can express, so each lives where it can be edited properly:
 
-| Key | Default | Notes |
+| What | Where | Headless |
 |---|---|---|
-| `intakeMode` | `thread` | `thread` or `http` |
-| `litellmUrl` | `http://localhost:4000/v1` | http mode only |
-| `litellmKey` | — | http mode only; secret |
-| `model` | `bulk-primary` | http mode only |
+| Intake lane | Settings → Plugins → Dispatch (bb's composer) | `bb dispatch lane` |
+| Enhancer template | The **Dispatch** panel | `bb dispatch enhancer` |
 
-Two things are deliberately **not** here. The thread-mode intake lane is picked
-with bb's composer in the settings section above the table's fields; the enhancer
-template is edited in the **Dispatch** panel, because bb settings support only
-single-line strings and the template is long.
+Reload after changing either: `bb plugin reload dispatch`.
 
 ## Prompt enhancer
 

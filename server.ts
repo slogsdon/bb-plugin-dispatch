@@ -4,15 +4,15 @@
 // project and the full prompt. That intake step is the part worth automating,
 // and it is the part bb has no surface for.
 //
-// Two model calls, both on the LiteLLM proxy rather than bb's internal
-// inference (which plugins cannot reach — PluginHosts exposes only port/tunnel
-// methods). Routing through LiteLLM is the better trade anyway: the lane is
-// explicit and swappable in models.yaml, every call is traced in Langfuse, and
-// intake runs on the Go lane so it costs no Claude quota.
+// Two model calls, both made by spawning a hidden bb thread on the intake lane.
+// Plugins cannot reach bb's internal inference — PluginHosts exposes only port
+// and tunnel methods — so a thread is the only way to invoke a model the user
+// has already configured. It is slower than a completion endpoint, and it is the
+// only path that works on a machine that is not this one.
 //
-// Expansion uses Shane's own "Prompt Enhancer" vault note, read at run time
-// through the obsidian CLI rather than copied here. Editing the note changes
-// dispatch; there is one canonical copy of that prompt.
+// Expansion uses a prompt enhancer template that ships with the plugin, or any
+// command's stdout (e.g. an obsidian note read at run time, so there is one
+// canonical copy of the prompt rather than a copy pasted in here).
 //
 // Safety: dispatch PREVIEWS by default and only spawns with --go. A plugin CLI
 // command is non-interactive — run() returns stdout and cannot prompt — so a
@@ -161,37 +161,29 @@ async function loadEnhancer(cfg: EnhancerConfig): Promise<string | null> {
 }
 
 
-type IntakeConfig = {
-  litellmUrl: string;
-  litellmKey: string;
-  model: string;
-  intakeMode: "thread" | "http";
-  lane: Lane | null;
-};
-
 /** One-shot completion by spawning a hidden bb thread.
  *
- *  This is the portable path: it works for any bb user on any provider they have
- *  configured, with no proxy and no API key of its own. Plugins cannot reach
- *  bb's internal inference, so a thread is the only way to invoke the model the
- *  standard selector already knows about.
+ *  Works for any bb user on any provider they have configured, with no proxy and
+ *  no API key of its own. An earlier version could instead POST to an
+ *  OpenAI-compatible proxy, which was faster and could *force* JSON through
+ *  `response_format` where an agent can only be asked — but it was a second code
+ *  path that only ran on a machine with LiteLLM in front of it, and it carried
+ *  four settings to configure something most installs could never use.
  *
- *  The trade against HTTP is real. An agent thread has tools and a personality,
- *  so the prompt has to forbid both and the caller has to parse tolerantly —
- *  a completion endpoint can be *forced* into JSON, an agent can only be asked.
- *  It is also slower: a spawn plus a turn, versus one request.
+ *  So the cost of this path is accepted rather than worked around: an agent
+ *  thread has tools and a personality, so the prompts forbid both and the caller
+ *  parses tolerantly.
  *
- *  Threads are hidden so they never appear in the sidebar, and deleted after the
+ *  Threads are hidden so they never appear in the sidebar, and archived after the
  *  answer is read so intake does not litter the project. */
 async function completeViaThread(
-  bb: BbPluginApi, cfg: IntakeConfig, prompt: string,
+  bb: BbPluginApi, lane: Lane, prompt: string,
 ): Promise<string> {
-  if (!cfg.lane) throw new Error("no intake lane set (Settings -> Plugins -> Dispatch)");
   // Spread the stored request verbatim: project, provider, model, reasoning,
   // permission, environment, and the provenance that keeps the first two from
   // being re-derived from project defaults.
   const spawned: any = await bb.sdk.threads.spawn({
-    ...cfg.lane,
+    ...lane,
     prompt,
     visibility: "hidden",
   } as any);
@@ -217,44 +209,18 @@ async function completeViaThread(
   }
 }
 
-async function completeViaHttp(
-  base: string, key: string, model: string, prompt: string, json: boolean,
-): Promise<string> {
-  const res = await fetch(`${base}/chat/completions`, {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-    body: JSON.stringify({
-      model,
-      // Generous budget on purpose: every Zen Go model is a reasoning model and
-      // spends max_tokens on reasoning before emitting content, so a small cap
-      // returns HTTP 200 with an empty string rather than an error.
-      max_tokens: 1600,
-      messages: [{ role: "user", content: prompt }],
-      ...(json ? { response_format: { type: "json_object" } } : {}),
-    }),
-  });
-  if (!res.ok) throw new Error(`LiteLLM HTTP ${res.status}`);
-  const data: any = await res.json();
-  const text = data?.choices?.[0]?.message?.content ?? "";
-  if (!text.trim()) throw new Error("LiteLLM returned empty content");
-  return text.trim();
-}
-
-/** Pick the backend. Thread mode is the default because it is the one that
- *  works on a machine that is not this one. */
+/** Ask the intake lane for one answer.
+ *
+ *  Agent threads narrate unless told not to, and there is no `response_format`
+ *  to lean on here, so the JSON ask is reinforced in the prompt itself and the
+ *  caller parses tolerantly. */
 async function complete(
-  bb: BbPluginApi, cfg: IntakeConfig, prompt: string, json: boolean,
+  bb: BbPluginApi, lane: Lane, prompt: string, json: boolean,
 ): Promise<string> {
-  if (cfg.intakeMode === "http") {
-    if (!cfg.litellmKey) throw new Error("http intake needs a LiteLLM key");
-    return completeViaHttp(cfg.litellmUrl, cfg.litellmKey, cfg.model, prompt, json);
-  }
-  // Agent threads narrate unless told not to; JSON asks are reinforced here
-  // rather than relying on a response_format the provider may not support.
   const guarded = json
     ? `${prompt}\n\nReply with the JSON object only. No preamble, no explanation, no tool use.`
     : `${prompt}\n\nReturn only the requested output. Do not use tools. Do not add commentary.`;
-  return completeViaThread(bb, cfg, guarded);
+  return completeViaThread(bb, lane, guarded);
 }
 
 function classifyPrompt(oneLiner: string, projects: Project[]): string {
@@ -303,11 +269,10 @@ type Intake = {
  *  that decides where work goes. */
 async function intake(
   bb: BbPluginApi,
-  cfg: IntakeConfig,
+  lane: Lane | null,
   request: string,
   opts: { projectId?: string | null; raw?: boolean },
 ): Promise<Intake> {
-  const usable = cfg.intakeMode === "http" ? Boolean(cfg.litellmKey) : Boolean(cfg.lane);
   const res: any = await bb.sdk.projects.list({ includePersonal: true } as any);
   const projects: Project[] = (res?.projects ?? res ?? []).map((p: any) => ({
     id: p.id, name: p.name, path: p.sources?.[0]?.path ?? null,
@@ -317,17 +282,13 @@ async function intake(
   let projectId: string | null = opts.projectId ?? null;
   let prompt = request;
 
-  if (!usable) {
-    notes.push(
-      cfg.intakeMode === "http"
-        ? "http intake selected but no LiteLLM key configured — intake skipped"
-        : "thread intake selected but no intake lane set — intake skipped",
-    );
+  if (!lane) {
+    notes.push("no intake lane set (Settings -> Plugins -> Dispatch) — intake skipped");
   }
 
-  if (!projectId && usable) {
+  if (!projectId && lane) {
     try {
-      const raw = await complete(bb, cfg, classifyPrompt(request, projects), true);
+      const raw = await complete(bb, lane, classifyPrompt(request, projects), true);
       const parsed = JSON.parse(stripFence(raw));
       if (projects.some((p) => p.id === parsed.projectId)) {
         projectId = parsed.projectId;
@@ -341,14 +302,14 @@ async function intake(
     }
   }
 
-  if (!opts.raw && usable) {
+  if (!opts.raw && lane) {
     const stored = (await bb.storage.kv.get<EnhancerConfig>(ENHANCER_KEY)) ?? DEFAULT_ENHANCER_CONFIG;
     const template = await loadEnhancer(stored);
     if (!template) {
       notes.push("enhancer unavailable (command failed, or template has no $ARGUMENTS) — using the request as written");
     } else {
       try {
-        prompt = stripFence(await complete(bb, cfg, template.replace("$ARGUMENTS", request), false));
+        prompt = stripFence(await complete(bb, lane, template.replace("$ARGUMENTS", request), false));
         notes.push("expanded via Prompt Enhancer");
       } catch (err) {
         notes.push(`expansion failed (${(err as Error).message}) — using the request as written`);
@@ -398,36 +359,14 @@ async function discoverRepos(bb: BbPluginApi): Promise<DiscoveredRepo[]> {
 
 
 export default async function plugin(bb: BbPluginApi) {
-  const settings = bb.settings.define({
-    litellmUrl: { type: "string", label: "LiteLLM base URL", default: "http://localhost:4000/v1" },
-    litellmKey: { type: "string", label: "LiteLLM master key", secret: true },
-    model: { type: "string", label: "HTTP mode: model alias", default: "bulk-primary" },
-    intakeMode: {
-      type: "select",
-      label: "Intake mode",
-      description:
-        "thread = spawn a hidden bb thread on any provider (portable, slower). " +
-        "http = one call to an OpenAI-compatible proxy (fast, needs LiteLLM).",
-      options: ["thread", "http"],
-      default: "thread",
-    },
-  });
-
-  // Provider, model, reasoning, permission, environment, and scratch project for
-  // thread intake are NOT settings. They live in kv and are picked with bb's own
-  // new-thread composer, rendered in the settings section below: `pi` has 373
-  // models on its own, so a `select` descriptor would be worse than the free-text
-  // pair this replaces, and there is no other host-owned picker to borrow.
-  const readCfg = async (): Promise<IntakeConfig> => {
-    const c = await settings.get();
-    return {
-      litellmUrl: String(c.litellmUrl),
-      litellmKey: String(c.litellmKey ?? ""),
-      model: String(c.model),
-      intakeMode: String(c.intakeMode) as "thread" | "http",
-      lane: (await bb.storage.kv.get<Lane>(LANE_KEY)) ?? null,
-    };
-  };
+  // No `bb.settings.define` at all. Everything intake needs — project, provider,
+  // model, reasoning, permission, environment — is one lane, and it is picked
+  // with bb's own new-thread composer in the settings section rather than typed
+  // into descriptors: `pi` alone publishes 373 models, so a `select` would be
+  // worse than free text, and the composer is the only host-owned picker the SDK
+  // exports. It lives in kv because a plugin can read its settings but not write
+  // them.
+  const loadLane = async () => (await bb.storage.kv.get<Lane>(LANE_KEY)) ?? null;
 
   bb.rpc.register(rpcContract, {
     projects: async () => {
@@ -436,20 +375,20 @@ export default async function plugin(bb: BbPluginApi) {
       return rows.map((p) => ({ id: p.id, name: p.name }));
     },
     preview: async ({ request, projectId, raw }) =>
-      intake(bb, await readCfg(), request, { projectId, raw }),
+      intake(bb, await loadLane(), request, { projectId, raw }),
     getEnhancer: async () =>
       (await bb.storage.kv.get<EnhancerConfig>(ENHANCER_KEY)) ?? DEFAULT_ENHANCER_CONFIG,
     setEnhancer: async (next) => {
       await bb.storage.kv.set(ENHANCER_KEY, next);
       return next;
     },
-    getLane: async () => (await bb.storage.kv.get<Lane>(LANE_KEY)) ?? null,
+    getLane: loadLane,
     setLane: async (next) => {
       await bb.storage.kv.set(LANE_KEY, next);
       return next;
     },
     dispatch: async ({ request, projectId, raw }) => {
-      const result = await intake(bb, await readCfg(), request, { projectId, raw });
+      const result = await intake(bb, await loadLane(), request, { projectId, raw });
       if (!result.projectId) throw new Error("no project resolved — choose one");
       const threadId = await spawnThread(bb, result.projectId, result.prompt);
       return { ...result, threadId };
@@ -646,7 +585,7 @@ export default async function plugin(bb: BbPluginApi) {
         .trim();
       if (!request) return { exitCode: 1, stderr: 'usage: bb dispatch "<request>" [--project <id>] [--raw] [--go]' };
 
-      const result = await intake(bb, await readCfg(), request, {
+      const result = await intake(bb, await loadLane(), request, {
         projectId: projectIdx >= 0 ? argv[valueIdx] : null,
         raw: flags.has("--raw"),
       });
