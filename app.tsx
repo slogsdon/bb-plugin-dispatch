@@ -9,17 +9,30 @@
 // confidence, so the flow shows you where it decided to send the work before
 // anything is spawned — the UI mirror of --go on the CLI.
 import { useCallback, useEffect, useState } from "react";
-import { definePluginApp, useBbNavigate, useRpc } from "@bb/plugin-sdk/app";
+import {
+  definePluginApp,
+  experimental_NewThreadComposer,
+  useBbNavigate,
+  useRpc,
+} from "@bb/plugin-sdk/app";
+import type { NewThreadRequest } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 
 type Project = { id: string; name: string };
 type Enhancer = { source: "text" | "command"; text: string; command: string };
+type Lane = { projectId: string; providerId: string; model: string };
 type Intake = {
   projectId: string | null;
   projectName: string | null;
   prompt: string;
   notes: string[];
 };
+
+// JSX resolves a lowercase-leading tag to an intrinsic HTML element, never to a
+// component in scope — `<experimental_NewThreadComposer />` renders a literal
+// <experimental_newthreadcomposer> custom element with all props stringified
+// onto it, silently and without a type error. Alias it to a capitalized name.
+const NewThreadComposer = experimental_NewThreadComposer;
 
 function DispatchPanel() {
   const rpc = useRpc<typeof rpcContract>();
@@ -194,7 +207,87 @@ function DispatchPanel() {
   );
 }
 
+/** Intake lane picker.
+ *
+ * The three things thread intake needs — project, provider, model — were three
+ * settings descriptors, two of them free text. `pi` alone publishes 373 models,
+ * so a `select` would have been worse than typing; and the SDK exports exactly
+ * one host-owned picker for this, the new-thread composer. So the composer IS
+ * the settings control: submitting saves the selections it resolved.
+ *
+ * The draft prompt is discarded on purpose — this surface picks a lane, it does
+ * not start work. What makes the round trip worth it is `executionInputSources`:
+ * the composer marks each selection caller-explicit, and without that the server
+ * drops the requested provider/model at spawn and re-derives them from the
+ * project's stored defaults. Storing the composer's own request verbatim is the
+ * only way a hand-built spawn keeps the lane it asked for. */
+function IntakeLaneSettings() {
+  const rpc = useRpc<typeof rpcContract>();
+  const [lane, setLane] = useState<Lane | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    rpc.call("getLane")
+      .then((l) => setLane(l as Lane | null))
+      .catch((e: Error) => setError(e.message))
+      .finally(() => setLoaded(true));
+  }, [rpc]);
+
+  const save = useCallback(
+    async (req: NewThreadRequest) => {
+      const { input, ...rest } = req;
+      setError(null);
+      try {
+        setLane((await rpc.call("setLane", rest as never)) as Lane);
+      } catch (e) {
+        setError((e as Error).message);
+        throw e; // keeps the draft — the composer clears it only on success
+      }
+    },
+    [rpc],
+  );
+
+  if (!loaded) return null;
+
+  return (
+    <div className="flex flex-col gap-3">
+      <p className="text-sm text-muted-foreground">
+        {lane ? (
+          <>
+            Intake runs on <code>{lane.providerId}</code> / <code>{lane.model}</code>, in project{" "}
+            <code>{lane.projectId}</code>.
+          </>
+        ) : (
+          <>No intake lane set — classification and prompt expansion are skipped until there is one.</>
+        )}
+      </p>
+      <p className="text-xs text-muted-foreground">
+        Pick the project, provider, and model below and submit. Submitting saves the lane; the
+        prompt you type is discarded and no thread is started.
+      </p>
+      {error ? <p className="text-sm text-destructive">{error}</p> : null}
+      <NewThreadComposer
+        defaultProjectId={lane?.projectId}
+        defaultProviderId={lane?.providerId}
+        defaultModel={lane?.model}
+        initialPrompt="Save this lane."
+        placeholder="Submit to save the selections above as the intake lane"
+        layout="document"
+        draftKey="dispatch:lane"
+        onSubmit={save}
+      />
+    </div>
+  );
+}
+
 export default definePluginApp((app) => {
+  app.slots.settingsSection({
+    id: "intake-lane",
+    title: "Intake lane",
+    description: "Where dispatch classifies and expands, before the real thread is spawned.",
+    component: IntakeLaneSettings,
+  });
   app.slots.navPanel({
     id: "dispatch",
     title: "Dispatch",

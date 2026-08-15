@@ -38,6 +38,28 @@ const intakeResult = z.object({
   notes: z.array(z.string()),
 });
 
+/** A `NewThreadRequest` minus its `input` — every selection bb's own composer
+ *  resolved, stored verbatim and spread straight back into `threads.spawn`.
+ *
+ *  Storing the whole request rather than a provider/model pair is what carries
+ *  `executionInputSources` through. The server drops a requested
+ *  `providerId`/`model` that arrives with no provenance and re-derives it from
+ *  the project's stored defaults, so a hand-built spawn can silently run on a
+ *  lane you did not pick. Round-tripping the composer's own request makes that
+ *  structurally impossible. */
+const laneSchema = z.object({
+  projectId: z.string(),
+  providerId: z.string(),
+  model: z.string(),
+  reasoningLevel: z.string().optional(),
+  permissionMode: z.string().optional(),
+  serviceTier: z.string().optional(),
+  executionInputSources: z.record(z.string(), z.string()).optional(),
+  environment: z.unknown().optional(),
+});
+type Lane = z.infer<typeof laneSchema>;
+const LANE_KEY = "lane";
+
 export const rpcContract = defineRpcContract({
   projects: {
     input: z.null(),
@@ -61,6 +83,8 @@ export const rpcContract = defineRpcContract({
   },
   getEnhancer: { input: z.null(), output: enhancerConfig },
   setEnhancer: { input: enhancerConfig, output: enhancerConfig },
+  getLane: { input: z.null(), output: laneSchema.nullable() },
+  setLane: { input: laneSchema, output: laneSchema },
 });
 
 type Project = { id: string; name: string; path?: string | null };
@@ -142,9 +166,7 @@ type IntakeConfig = {
   litellmKey: string;
   model: string;
   intakeMode: "thread" | "http";
-  intakeProvider: string;
-  intakeModel: string;
-  intakeProject: string;
+  lane: Lane | null;
 };
 
 /** One-shot completion by spawning a hidden bb thread.
@@ -164,20 +186,14 @@ type IntakeConfig = {
 async function completeViaThread(
   bb: BbPluginApi, cfg: IntakeConfig, prompt: string,
 ): Promise<string> {
-  if (!cfg.intakeProject) {
-    throw new Error("no scratch project set for thread intake (plugin settings)");
-  }
+  if (!cfg.lane) throw new Error("no intake lane set (Settings -> Plugins -> Dispatch)");
+  // Spread the stored request verbatim: project, provider, model, reasoning,
+  // permission, environment, and the provenance that keeps the first two from
+  // being re-derived from project defaults.
   const spawned: any = await bb.sdk.threads.spawn({
-    projectId: cfg.intakeProject,
+    ...cfg.lane,
     prompt,
-    providerId: cfg.intakeProvider || undefined,
-    model: cfg.intakeModel || undefined,
     visibility: "hidden",
-    environment: {
-      type: "host",
-      hostId: await defaultHostId(bb),
-      workspace: { type: "unmanaged", path: null },
-    },
   } as any);
   const threadId: string = spawned?.thread?.id ?? spawned?.id ?? "";
   if (!threadId) throw new Error("intake thread did not start");
@@ -291,7 +307,7 @@ async function intake(
   request: string,
   opts: { projectId?: string | null; raw?: boolean },
 ): Promise<Intake> {
-  const usable = cfg.intakeMode === "http" ? Boolean(cfg.litellmKey) : Boolean(cfg.intakeProject);
+  const usable = cfg.intakeMode === "http" ? Boolean(cfg.litellmKey) : Boolean(cfg.lane);
   const res: any = await bb.sdk.projects.list({ includePersonal: true } as any);
   const projects: Project[] = (res?.projects ?? res ?? []).map((p: any) => ({
     id: p.id, name: p.name, path: p.sources?.[0]?.path ?? null,
@@ -305,7 +321,7 @@ async function intake(
     notes.push(
       cfg.intakeMode === "http"
         ? "http intake selected but no LiteLLM key configured — intake skipped"
-        : "thread intake selected but no scratch project configured — intake skipped",
+        : "thread intake selected but no intake lane set — intake skipped",
     );
   }
 
@@ -395,25 +411,21 @@ export default async function plugin(bb: BbPluginApi) {
       options: ["thread", "http"],
       default: "thread",
     },
-    intakeProvider: { type: "string", label: "Thread mode: provider", default: "pi" },
-    intakeModel: { type: "string", label: "Thread mode: model", default: "litellm/bulk-primary" },
-    intakeProject: {
-      type: "project",
-      label: "Thread mode: scratch project",
-      description: "Where intake threads are created. They are hidden and deleted after use.",
-    },
   });
 
-  const readCfg = async () => {
+  // Provider, model, reasoning, permission, environment, and scratch project for
+  // thread intake are NOT settings. They live in kv and are picked with bb's own
+  // new-thread composer, rendered in the settings section below: `pi` has 373
+  // models on its own, so a `select` descriptor would be worse than the free-text
+  // pair this replaces, and there is no other host-owned picker to borrow.
+  const readCfg = async (): Promise<IntakeConfig> => {
     const c = await settings.get();
     return {
       litellmUrl: String(c.litellmUrl),
       litellmKey: String(c.litellmKey ?? ""),
       model: String(c.model),
       intakeMode: String(c.intakeMode) as "thread" | "http",
-      intakeProvider: String(c.intakeProvider),
-      intakeModel: String(c.intakeModel),
-      intakeProject: c.intakeProject ? String(c.intakeProject) : "",
+      lane: (await bb.storage.kv.get<Lane>(LANE_KEY)) ?? null,
     };
   };
 
@@ -429,6 +441,11 @@ export default async function plugin(bb: BbPluginApi) {
       (await bb.storage.kv.get<EnhancerConfig>(ENHANCER_KEY)) ?? DEFAULT_ENHANCER_CONFIG,
     setEnhancer: async (next) => {
       await bb.storage.kv.set(ENHANCER_KEY, next);
+      return next;
+    },
+    getLane: async () => (await bb.storage.kv.get<Lane>(LANE_KEY)) ?? null,
+    setLane: async (next) => {
+      await bb.storage.kv.set(LANE_KEY, next);
       return next;
     },
     dispatch: async ({ request, projectId, raw }) => {
@@ -454,6 +471,11 @@ export default async function plugin(bb: BbPluginApi) {
         name: "projects",
         summary: "List host repos that are not bb projects, and register them",
         usage: "bb dispatch projects [--register <name,name|all>]",
+      },
+      {
+        name: "lane",
+        summary: "Show or set the intake lane (the settings composer, headless)",
+        usage: "bb dispatch lane [--provider <id> --model <id> --project <id>]",
       },
       {
         name: "enhancer",
@@ -531,6 +553,47 @@ export default async function plugin(bb: BbPluginApi) {
         }
         const failed = done.some((d) => d.startsWith("FAILED"));
         return { exitCode: failed ? 1 : 0, stdout: done.join("\n") };
+      }
+
+      // The headless counterpart to the settings composer. The composer resolves
+      // environment and provenance itself; here they are synthesised, since a
+      // shell has no picker to resolve them from.
+      if (argv[0] === "lane") {
+        const rest = argv.slice(1);
+        const flag = (name: string) => {
+          const i = rest.indexOf(`--${name}`);
+          return i >= 0 ? rest[i + 1] : undefined;
+        };
+        const providerId = flag("provider");
+        const model = flag("model");
+        const projectId = flag("project");
+        if (!providerId && !model && !projectId) {
+          const cur = await bb.storage.kv.get<Lane>(LANE_KEY);
+          return {
+            exitCode: cur ? 0 : 1,
+            stdout: cur
+              ? `project:  ${cur.projectId}\nprovider: ${cur.providerId}\nmodel:    ${cur.model}`
+              : "no intake lane set",
+          };
+        }
+        if (!providerId || !model || !projectId) {
+          return { exitCode: 1, stderr: "--provider, --model, and --project are all required" };
+        }
+        const next: Lane = {
+          projectId,
+          providerId,
+          model,
+          // Without provenance the server drops providerId/model and re-derives
+          // them from the project's defaults, silently running intake elsewhere.
+          executionInputSources: { providerId: "explicit", model: "explicit" },
+          environment: {
+            type: "host",
+            hostId: await defaultHostId(bb),
+            workspace: { type: "unmanaged", path: null },
+          },
+        };
+        await bb.storage.kv.set(LANE_KEY, next);
+        return { exitCode: 0, stdout: `intake lane set: ${providerId} / ${model} in ${projectId}` };
       }
 
       if (argv[0] === "enhancer") {

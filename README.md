@@ -29,11 +29,11 @@ you into the new thread.
 Plugins cannot reach bb's internal inference (`PluginHosts` exposes only port and
 tunnel methods), so intake needs its own way to call a model. Two, by setting:
 
-**`thread`** (default) — spawns a hidden bb thread on any provider and model from
-the standard selector, waits, reads the output, archives it. Portable: works for
-any bb user with any provider, no proxy and no API key. Slower — a spawn plus a
-turn rather than one request — and an agent has tools and a personality, so the
-prompts forbid both and parsing is tolerant.
+**`thread`** (default) — spawns a hidden bb thread on the **intake lane** (see
+below), waits, reads the output, archives it. Portable: works for any bb user
+with any provider, no proxy and no API key. Slower — a spawn plus a turn rather
+than one request — and an agent has tools and a personality, so the prompts
+forbid both and parsing is tolerant.
 
 **`http`** — one call to an OpenAI-compatible proxy. Fast, but assumes you run
 one. Set `litellmUrl`, `litellmKey`, and `model`.
@@ -45,6 +45,40 @@ lane without the plugin knowing anything about the proxy.
 Intake threads are **archived, not deleted** — bb refuses destructive actions
 without an interactive confirmation, so deleting them fails silently and leaks
 hidden threads.
+
+## The intake lane
+
+Project, provider, model, reasoning, permission mode, and environment for thread
+intake are picked with **bb's own new-thread composer**, rendered in Settings →
+Plugins → Dispatch. Submitting saves the selections; the prompt you type is
+discarded and no thread is started.
+
+This is not a settings page in disguise, it is the only correct way to do it:
+
+- `pi` alone publishes 373 models, so a `select` descriptor would have been worse
+  than the free-text pair it replaces, and the composer is the only host-owned
+  picker the SDK exports.
+- The composer marks every selection **caller-explicit** in
+  `executionInputSources`, and the whole request is stored and spread back into
+  `threads.spawn` verbatim. That is load-bearing: the server drops a requested
+  `providerId`/`model` that arrives with no provenance and re-derives it from the
+  project's stored defaults. A hand-built spawn can therefore run intake on a
+  lane you never chose, silently and at someone else's cost.
+
+The lane lives in plugin kv rather than in settings, because a plugin can read
+its settings but not write them — the same reason the enhancer template lives
+there.
+
+Headless equivalent, for a machine with no UI:
+
+```bash
+bb dispatch lane                          # show current
+bb dispatch lane --provider pi --model litellm/bulk-primary --project proj_abc123
+```
+
+The CLI form synthesises the provenance and a default host environment, since a
+shell has no picker to resolve them from. It marks only `providerId` and `model`
+explicit; reasoning and permission mode fall through to the usual defaults.
 
 ## Limitations
 
@@ -109,15 +143,14 @@ interactive channel, so the preview/`--go` two-step *is* the confirmation.
 | Key | Default | Notes |
 |---|---|---|
 | `intakeMode` | `thread` | `thread` or `http` |
-| `intakeProvider` | `pi` | thread mode: provider id |
-| `intakeModel` | `litellm/bulk-primary` | thread mode: model id |
-| `intakeProject` | — | thread mode: where hidden intake threads are created |
 | `litellmUrl` | `http://localhost:4000/v1` | http mode only |
 | `litellmKey` | — | http mode only; secret |
 | `model` | `bulk-primary` | http mode only |
 
-The enhancer is configured in the **Dispatch** panel rather than here, because bb
-settings support only single-line strings and the template is long.
+Two things are deliberately **not** here. The thread-mode intake lane is picked
+with bb's composer in the settings section above the table's fields; the enhancer
+template is edited in the **Dispatch** panel, because bb settings support only
+single-line strings and the template is long.
 
 ## Prompt enhancer
 
@@ -155,3 +188,10 @@ Reload after changing settings: `bb plugin reload dispatch`.
 Installed from a path, so the backend loads `server.ts` directly — edit and
 `bb plugin reload dispatch`. Frontend changes need `bb plugin build .` first, or
 run `bb plugin dev` to watch.
+
+**Alias the SDK's `experimental_` components before using them in JSX.** A
+lowercase-leading tag resolves to an intrinsic HTML element, never to a component
+in scope, so `<experimental_NewThreadComposer />` renders a literal
+`<experimental_newthreadcomposer>` custom element with every prop stringified
+onto it. It type-checks, logs nothing, and shows an empty gap where the component
+should be. Assign it to a capitalized name first.
