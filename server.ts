@@ -136,7 +136,72 @@ async function loadEnhancer(cfg: EnhancerConfig): Promise<string | null> {
   return body.includes("$ARGUMENTS") ? body : null;
 }
 
-async function complete(
+
+type IntakeConfig = {
+  litellmUrl: string;
+  litellmKey: string;
+  model: string;
+  intakeMode: "thread" | "http";
+  intakeProvider: string;
+  intakeModel: string;
+  intakeProject: string;
+};
+
+/** One-shot completion by spawning a hidden bb thread.
+ *
+ *  This is the portable path: it works for any bb user on any provider they have
+ *  configured, with no proxy and no API key of its own. Plugins cannot reach
+ *  bb's internal inference, so a thread is the only way to invoke the model the
+ *  standard selector already knows about.
+ *
+ *  The trade against HTTP is real. An agent thread has tools and a personality,
+ *  so the prompt has to forbid both and the caller has to parse tolerantly —
+ *  a completion endpoint can be *forced* into JSON, an agent can only be asked.
+ *  It is also slower: a spawn plus a turn, versus one request.
+ *
+ *  Threads are hidden so they never appear in the sidebar, and deleted after the
+ *  answer is read so intake does not litter the project. */
+async function completeViaThread(
+  bb: BbPluginApi, cfg: IntakeConfig, prompt: string,
+): Promise<string> {
+  if (!cfg.intakeProject) {
+    throw new Error("no scratch project set for thread intake (plugin settings)");
+  }
+  const spawned: any = await bb.sdk.threads.spawn({
+    projectId: cfg.intakeProject,
+    prompt,
+    providerId: cfg.intakeProvider || undefined,
+    model: cfg.intakeModel || undefined,
+    visibility: "hidden",
+    environment: {
+      type: "host",
+      hostId: await defaultHostId(bb),
+      workspace: { type: "unmanaged", path: null },
+    },
+  } as any);
+  const threadId: string = spawned?.thread?.id ?? spawned?.id ?? "";
+  if (!threadId) throw new Error("intake thread did not start");
+  try {
+    await bb.sdk.threads.wait({ threadId, status: "idle", timeoutMs: 180_000 } as any);
+    const out: any = await bb.sdk.threads.output({ threadId } as any);
+    const text = (typeof out === "string" ? out : out?.output ?? out?.text ?? "").trim();
+    if (!text) throw new Error("intake thread produced no output");
+    return text;
+  } finally {
+    // Archive, not delete: delete is a destructive action bb refuses without an
+    // interactive confirmation, so it failed silently and leaked hidden threads
+    // until this was caught. Archived + hidden is invisible and recoverable.
+    // Log the failure rather than swallowing it — a silent cleanup failure is
+    // how the leak went unnoticed in the first place.
+    try {
+      await bb.sdk.threads.archive({ threadId } as any);
+    } catch (err) {
+      bb.log.warn(`intake thread ${threadId} left behind: ${(err as Error).message}`);
+    }
+  }
+}
+
+async function completeViaHttp(
   base: string, key: string, model: string, prompt: string, json: boolean,
 ): Promise<string> {
   const res = await fetch(`${base}/chat/completions`, {
@@ -157,6 +222,23 @@ async function complete(
   const text = data?.choices?.[0]?.message?.content ?? "";
   if (!text.trim()) throw new Error("LiteLLM returned empty content");
   return text.trim();
+}
+
+/** Pick the backend. Thread mode is the default because it is the one that
+ *  works on a machine that is not this one. */
+async function complete(
+  bb: BbPluginApi, cfg: IntakeConfig, prompt: string, json: boolean,
+): Promise<string> {
+  if (cfg.intakeMode === "http") {
+    if (!cfg.litellmKey) throw new Error("http intake needs a LiteLLM key");
+    return completeViaHttp(cfg.litellmUrl, cfg.litellmKey, cfg.model, prompt, json);
+  }
+  // Agent threads narrate unless told not to; JSON asks are reinforced here
+  // rather than relying on a response_format the provider may not support.
+  const guarded = json
+    ? `${prompt}\n\nReply with the JSON object only. No preamble, no explanation, no tool use.`
+    : `${prompt}\n\nReturn only the requested output. Do not use tools. Do not add commentary.`;
+  return completeViaThread(bb, cfg, guarded);
 }
 
 function classifyPrompt(oneLiner: string, projects: Project[]): string {
@@ -205,11 +287,11 @@ type Intake = {
  *  that decides where work goes. */
 async function intake(
   bb: BbPluginApi,
-  cfg: { litellmUrl: string; litellmKey: string; model: string },
+  cfg: IntakeConfig,
   request: string,
   opts: { projectId?: string | null; raw?: boolean },
 ): Promise<Intake> {
-  const { litellmUrl: base, litellmKey: key, model } = cfg;
+  const usable = cfg.intakeMode === "http" ? Boolean(cfg.litellmKey) : Boolean(cfg.intakeProject);
   const res: any = await bb.sdk.projects.list({ includePersonal: true } as any);
   const projects: Project[] = (res?.projects ?? res ?? []).map((p: any) => ({
     id: p.id, name: p.name, path: p.sources?.[0]?.path ?? null,
@@ -219,11 +301,17 @@ async function intake(
   let projectId: string | null = opts.projectId ?? null;
   let prompt = request;
 
-  if (!key) notes.push("no LiteLLM key configured — intake skipped");
+  if (!usable) {
+    notes.push(
+      cfg.intakeMode === "http"
+        ? "http intake selected but no LiteLLM key configured — intake skipped"
+        : "thread intake selected but no scratch project configured — intake skipped",
+    );
+  }
 
-  if (!projectId && key) {
+  if (!projectId && usable) {
     try {
-      const raw = await complete(base, key, model, classifyPrompt(request, projects), true);
+      const raw = await complete(bb, cfg, classifyPrompt(request, projects), true);
       const parsed = JSON.parse(stripFence(raw));
       if (projects.some((p) => p.id === parsed.projectId)) {
         projectId = parsed.projectId;
@@ -237,14 +325,14 @@ async function intake(
     }
   }
 
-  if (!opts.raw && key) {
+  if (!opts.raw && usable) {
     const stored = (await bb.storage.kv.get<EnhancerConfig>(ENHANCER_KEY)) ?? DEFAULT_ENHANCER_CONFIG;
     const template = await loadEnhancer(stored);
     if (!template) {
       notes.push("enhancer unavailable (command failed, or template has no $ARGUMENTS) — using the request as written");
     } else {
       try {
-        prompt = stripFence(await complete(base, key, model, template.replace("$ARGUMENTS", request), false));
+        prompt = stripFence(await complete(bb, cfg, template.replace("$ARGUMENTS", request), false));
         notes.push("expanded via Prompt Enhancer");
       } catch (err) {
         notes.push(`expansion failed (${(err as Error).message}) — using the request as written`);
@@ -273,7 +361,23 @@ export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     litellmUrl: { type: "string", label: "LiteLLM base URL", default: "http://localhost:4000/v1" },
     litellmKey: { type: "string", label: "LiteLLM master key", secret: true },
-    model: { type: "string", label: "Intake model (alias)", default: "bulk-primary" },
+    model: { type: "string", label: "HTTP mode: model alias", default: "bulk-primary" },
+    intakeMode: {
+      type: "select",
+      label: "Intake mode",
+      description:
+        "thread = spawn a hidden bb thread on any provider (portable, slower). " +
+        "http = one call to an OpenAI-compatible proxy (fast, needs LiteLLM).",
+      options: ["thread", "http"],
+      default: "thread",
+    },
+    intakeProvider: { type: "string", label: "Thread mode: provider", default: "pi" },
+    intakeModel: { type: "string", label: "Thread mode: model", default: "litellm/bulk-primary" },
+    intakeProject: {
+      type: "project",
+      label: "Thread mode: scratch project",
+      description: "Where intake threads are created. They are hidden and deleted after use.",
+    },
   });
 
   const readCfg = async () => {
@@ -282,6 +386,10 @@ export default async function plugin(bb: BbPluginApi) {
       litellmUrl: String(c.litellmUrl),
       litellmKey: String(c.litellmKey ?? ""),
       model: String(c.model),
+      intakeMode: String(c.intakeMode) as "thread" | "http",
+      intakeProvider: String(c.intakeProvider),
+      intakeModel: String(c.intakeModel),
+      intakeProject: c.intakeProject ? String(c.intakeProject) : "",
     };
   };
 

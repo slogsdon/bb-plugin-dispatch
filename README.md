@@ -24,10 +24,27 @@ you into the new thread.
 3. **Spawn** — `sdk.threads.spawn()` into the chosen project, which inherits
    that project's remembered provider/model defaults.
 
-Both model calls go to the LiteLLM proxy, not bb's internal inference (plugins
-cannot reach it — `PluginHosts` exposes only port and tunnel methods). That is
-the better trade anyway: the lane is explicit and swappable in `models.yaml`,
-calls are traced, and intake runs on a cheap lane rather than a subscription.
+## Intake modes
+
+Plugins cannot reach bb's internal inference (`PluginHosts` exposes only port and
+tunnel methods), so intake needs its own way to call a model. Two, by setting:
+
+**`thread`** (default) — spawns a hidden bb thread on any provider and model from
+the standard selector, waits, reads the output, archives it. Portable: works for
+any bb user with any provider, no proxy and no API key. Slower — a spawn plus a
+turn rather than one request — and an agent has tools and a personality, so the
+prompts forbid both and parsing is tolerant.
+
+**`http`** — one call to an OpenAI-compatible proxy. Fast, but assumes you run
+one. Set `litellmUrl`, `litellmKey`, and `model`.
+
+If you already run LiteLLM, note that `pi` exposes its aliases to bb's model
+selector (`litellm/bulk-primary` and friends), so thread mode reaches the same
+lane without the plugin knowing anything about the proxy.
+
+Intake threads are **archived, not deleted** — bb refuses destructive actions
+without an interactive confirmation, so deleting them fails silently and leaks
+hidden threads.
 
 ## Limitations
 
@@ -54,7 +71,7 @@ project you name:
 
 | Failure | Effect |
 |---|---|
-| LiteLLM unreachable or key unset | no classification, no expansion — pass `--project` |
+| Intake unconfigured or unreachable | no classification, no expansion — pass `--project` |
 | Enhancer command fails, or template lacks `$ARGUMENTS` | no expansion; request used as written |
 | Classifier returns an unknown project id | ignored; pass `--project` |
 
@@ -71,9 +88,13 @@ interactive channel, so the preview/`--go` two-step *is* the confirmation.
 
 | Key | Default | Notes |
 |---|---|---|
-| `litellmUrl` | `http://localhost:4000/v1` | OpenAI-compatible base URL |
-| `litellmKey` | — | secret; required for any intake |
-| `model` | `bulk-primary` | alias to classify and expand with |
+| `intakeMode` | `thread` | `thread` or `http` |
+| `intakeProvider` | `pi` | thread mode: provider id |
+| `intakeModel` | `litellm/bulk-primary` | thread mode: model id |
+| `intakeProject` | — | thread mode: where hidden intake threads are created |
+| `litellmUrl` | `http://localhost:4000/v1` | http mode only |
+| `litellmKey` | — | http mode only; secret |
+| `model` | `bulk-primary` | http mode only |
 
 The enhancer is configured in the **Dispatch** panel rather than here, because bb
 settings support only single-line strings and the template is long.
