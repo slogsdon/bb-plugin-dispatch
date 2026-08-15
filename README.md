@@ -110,6 +110,17 @@ Two sources, chosen from a dropdown in the panel:
   `obsidian read path="Prompts/Enhancer.md"`. Fenced output (` ``` ` or `~~~`)
   is unwrapped automatically.
 
+Set it headlessly (the panel editor is the other way):
+
+```bash
+bb dispatch enhancer                                    # show current
+bb dispatch enhancer --command 'obsidian read path="Prompts/Enhancer.md"'
+bb dispatch enhancer --source text                      # back to the bundled template
+```
+
+Setting it resolves the template immediately and fails loudly if the command
+does not produce one, rather than silently degrading at the next dispatch.
+
 Either way the template must contain `$ARGUMENTS`, which is replaced with the
 request. Without it, expansion is skipped rather than sending a malformed
 prompt.

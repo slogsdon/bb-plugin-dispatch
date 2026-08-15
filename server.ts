@@ -427,12 +427,55 @@ export default async function plugin(bb: BbPluginApi) {
         usage: 'bb dispatch "fix the flaky auth test"',
       },
       {
+        name: "enhancer",
+        summary: "Show or set the prompt enhancer (the panel's editor, headless)",
+        usage: 'bb dispatch enhancer [--command \'obsidian read path="X.md"\' | --source text]',
+      },
+      {
         name: "go",
         summary: "Spawn the thread (--project to skip classification, --raw to skip expansion)",
         usage: 'bb dispatch "<request>" [--project <id>] [--raw] --go',
       },
     ],
     async run(argv) {
+      // `enhancer` configures what the panel's editor edits. The template lives
+      // in kv rather than plugin settings (bb settings have no multiline type),
+      // so without this there is no way to set it on a headless machine.
+      if (argv[0] === "enhancer") {
+        const rest = argv.slice(1);
+        const current =
+          (await bb.storage.kv.get<EnhancerConfig>(ENHANCER_KEY)) ?? DEFAULT_ENHANCER_CONFIG;
+        const cmdIdx = rest.indexOf("--command");
+        const srcIdx = rest.indexOf("--source");
+        if (cmdIdx < 0 && srcIdx < 0) {
+          const body = current.source === "command" ? current.command : current.text;
+          return { exitCode: 0, stdout: `source: ${current.source}\n\n${body}` };
+        }
+        const next: EnhancerConfig = { ...current };
+        if (cmdIdx >= 0) {
+          next.command = rest[cmdIdx + 1] ?? "";
+          next.source = "command";
+        }
+        if (srcIdx >= 0) {
+          const v = rest[srcIdx + 1];
+          if (v !== "text" && v !== "command") {
+            return { exitCode: 1, stderr: "--source must be text or command" };
+          }
+          next.source = v;
+        }
+        await bb.storage.kv.set(ENHANCER_KEY, next);
+        // Resolve it immediately: a command that cannot produce a usable
+        // template should fail here, not silently at the next dispatch.
+        const check = await loadEnhancer(next);
+        return {
+          exitCode: check ? 0 : 1,
+          stdout: `source: ${next.source}\n` +
+            (check
+              ? `resolves OK (${check.length} chars)`
+              : "DOES NOT RESOLVE — command failed, or template has no $ARGUMENTS"),
+        };
+      }
+
       if (argv[0] === "preview" || argv[0] === "go") {
         if (argv[0] === "go") argv = [...argv.slice(1), "--go"];
         else argv = argv.slice(1);
