@@ -34,6 +34,15 @@ type Intake = {
 // onto it, silently and without a type error. Alias it to a capitalized name.
 const NewThreadComposer = experimental_NewThreadComposer;
 
+// iOS Safari auto-zooms any focused form control whose font size is under
+// 16px, and an "Add to Home Screen" launch pins the viewport so the zoom
+// cannot be pinched back out. The host styles ship the coarse-pointer
+// variants (14px on a desktop pointer, 16px on a phone) — the same pattern
+// the chief-of-staff plugin uses for its composer — so focusable controls
+// opt into them instead of hardcoding a size that traps an iPhone user.
+const COARSE_POINTER_TEXT_BASE_CLASS = "text-sm max-md:pointer-coarse:text-base";
+const COARSE_POINTER_TEXT_SM_CLASS = "text-xs max-md:pointer-coarse:text-sm";
+
 function DispatchPanel() {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
@@ -92,14 +101,14 @@ function DispatchPanel() {
         onChange={(e) => setRequest(e.target.value)}
         placeholder="fix the flaky auth test"
         rows={3}
-        className="w-full resize-y rounded-md border bg-background p-3 text-sm outline-none focus-visible:ring-1 focus-visible:ring-ring"
+        className={`w-full resize-y rounded-md border bg-background p-3 ${COARSE_POINTER_TEXT_BASE_CLASS} outline-none focus-visible:ring-1 focus-visible:ring-ring`}
       />
 
       <div className="flex flex-wrap items-center gap-3 text-sm">
         <select
           value={projectId}
           onChange={(e) => setProjectId(e.target.value)}
-          className="rounded-md border bg-background px-2 py-1.5 text-sm"
+          className={`rounded-md border bg-background px-2 py-1.5 ${COARSE_POINTER_TEXT_BASE_CLASS}`}
         >
           <option value="">Project: auto-detect</option>
           {projects.map((p) => (
@@ -136,7 +145,7 @@ function DispatchPanel() {
             <select
               value={enhancer.source}
               onChange={(e) => saveEnhancer({ ...enhancer, source: e.target.value as Enhancer["source"] })}
-              className="rounded-md border bg-background px-2 py-1.5 text-sm"
+              className={`rounded-md border bg-background px-2 py-1.5 ${COARSE_POINTER_TEXT_BASE_CLASS}`}
             >
               <option value="text">Text</option>
               <option value="command">Command</option>
@@ -152,7 +161,7 @@ function DispatchPanel() {
                 onBlur={() => saveEnhancer(enhancer)}
                 rows={14}
                 spellCheck={false}
-                className="w-full resize-y rounded-md border bg-background p-3 font-mono text-xs outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                className={`w-full resize-y rounded-md border bg-background p-3 font-mono ${COARSE_POINTER_TEXT_SM_CLASS} outline-none focus-visible:ring-1 focus-visible:ring-ring`}
               />
               <p className="text-xs text-muted-foreground">
                 Must contain <code>$ARGUMENTS</code>, which is replaced with your request.
@@ -167,7 +176,7 @@ function DispatchPanel() {
                 onBlur={() => saveEnhancer(enhancer)}
                 placeholder={'obsidian read path="Prompts/Enhancer.md"'}
                 spellCheck={false}
-                className="w-full rounded-md border bg-background px-3 py-2 font-mono text-xs outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                className={`w-full rounded-md border bg-background px-3 py-2 font-mono ${COARSE_POINTER_TEXT_SM_CLASS} outline-none focus-visible:ring-1 focus-visible:ring-ring`}
               />
               <p className="text-xs text-muted-foreground">
                 Shell command whose stdout is the template — use this to keep the prompt
