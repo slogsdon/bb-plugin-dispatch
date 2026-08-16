@@ -149,6 +149,7 @@ can express, so each lives where it can be edited properly:
 |---|---|---|
 | Intake lane | Settings → Plugins → Dispatch (bb's composer) | `bb dispatch lane` |
 | Enhancer template | The **Dispatch** panel | `bb dispatch enhancer` |
+| Dispatch history | The **Dispatch** panel (below the composer) | — |
 
 Reload after changing either: `bb plugin reload dispatch`.
 

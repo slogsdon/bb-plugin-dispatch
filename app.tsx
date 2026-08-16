@@ -34,6 +34,13 @@ type Intake = {
 // onto it, silently and without a type error. Alias it to a capitalized name.
 const NewThreadComposer = experimental_NewThreadComposer;
 
+type DispatchRecord = {
+  threadId: string;
+  request: string;
+  projectName: string | null;
+  createdAt: string;
+};
+
 // iOS Safari auto-zooms any focused form control whose font size is under
 // 16px, and an "Add to Home Screen" launch pins the viewport so the zoom
 // cannot be pinched back out. The host styles ship the coarse-pointer
@@ -42,6 +49,17 @@ const NewThreadComposer = experimental_NewThreadComposer;
 // opt into them instead of hardcoding a size that traps an iPhone user.
 const COARSE_POINTER_TEXT_BASE_CLASS = "text-sm max-md:pointer-coarse:text-base";
 const COARSE_POINTER_TEXT_SM_CLASS = "text-xs max-md:pointer-coarse:text-sm";
+
+function timeAgo(iso: string): string {
+  const s = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+  if (s < 60) return "just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  return d === 1 ? "yesterday" : `${d}d ago`;
+}
 
 function DispatchPanel() {
   const rpc = useRpc<typeof rpcContract>();
@@ -56,10 +74,12 @@ function DispatchPanel() {
   const [enhancer, setEnhancer] = useState<Enhancer | null>(null);
   const [showEnhancer, setShowEnhancer] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [history, setHistory] = useState<DispatchRecord[]>([]);
 
   useEffect(() => {
     rpc.call("projects").then((p) => setProjects(p as Project[])).catch(() => {});
     rpc.call("getEnhancer").then((e) => setEnhancer(e as Enhancer)).catch(() => {});
+    rpc.call("history").then((h) => setHistory(h as DispatchRecord[])).catch(() => {});
   }, [rpc]);
 
   const saveEnhancer = useCallback((next: Enhancer) => {
@@ -84,6 +104,10 @@ function DispatchPanel() {
       .then((r) => {
         const res = r as Intake & { threadId: string };
         setResult(res);
+        setHistory((prev) => [
+          { threadId: res.threadId, request, projectName: res.projectName, createdAt: new Date().toISOString() },
+          ...prev,
+        ]);
         // Land the user in the thread they just started — the whole point is to
         // get from an idea to running work without navigating.
         if (res.threadId) navigate.toThread(res.threadId);
@@ -128,6 +152,29 @@ function DispatchPanel() {
           </button>
         </div>
       </div>
+
+      {history.length > 0 ? (
+        <div className="rounded-lg border">
+          <div className="border-b px-3 py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Dispatched
+          </div>
+          <ul className="divide-y divide-border">
+            {history.map((h) => (
+              <li key={h.threadId}>
+                <button
+                  onClick={() => navigate.toThread(h.threadId)}
+                  className="flex w-full flex-col gap-0.5 px-3 py-2 text-left hover:bg-muted"
+                >
+                  <span className="truncate text-sm font-medium">{h.request}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {h.projectName ?? "unknown project"} · {timeAgo(h.createdAt)}
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
 
       <div>
         <button

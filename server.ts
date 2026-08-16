@@ -38,6 +38,13 @@ const intakeResult = z.object({
   notes: z.array(z.string()),
 });
 
+const dispatchRecord = z.object({
+  threadId: z.string(),
+  request: z.string(),
+  projectName: z.string().nullable(),
+  createdAt: z.string(),
+});
+
 /** A `NewThreadRequest` minus its `input` — every selection bb's own composer
  *  resolved, stored verbatim and spread straight back into `threads.spawn`.
  *
@@ -59,6 +66,21 @@ const laneSchema = z.object({
 });
 type Lane = z.infer<typeof laneSchema>;
 const LANE_KEY = "lane";
+const DISPATCH_HISTORY_KEY = "dispatchHistory";
+const DISPATCH_HISTORY_CAP = 25;
+
+/** Newest-first record of spawned dispatch threads, kept in kv. Capped so a
+ *  long-lived install does not grow without bound. A read-modify-write race
+ *  between two simultaneous dispatches can drop an entry — acceptable for a
+ *  personal history list. */
+async function recordDispatch(
+  bb: BbPluginApi,
+  entry: z.infer<typeof dispatchRecord>,
+): Promise<void> {
+  const existing =
+    (await bb.storage.kv.get<z.infer<typeof dispatchRecord>[]>(DISPATCH_HISTORY_KEY)) ?? [];
+  await bb.storage.kv.set(DISPATCH_HISTORY_KEY, [entry, ...existing].slice(0, DISPATCH_HISTORY_CAP));
+}
 
 export const rpcContract = defineRpcContract({
   projects: {
@@ -85,6 +107,7 @@ export const rpcContract = defineRpcContract({
   setEnhancer: { input: enhancerConfig, output: enhancerConfig },
   getLane: { input: z.null(), output: laneSchema.nullable() },
   setLane: { input: laneSchema, output: laneSchema },
+  history: { input: z.null(), output: z.array(dispatchRecord) },
 });
 
 type Project = { id: string; name: string; path?: string | null };
@@ -390,8 +413,16 @@ export default async function plugin(bb: BbPluginApi) {
       const result = await intake(bb, await loadLane(), request, { projectId, raw });
       if (!result.projectId) throw new Error("no project resolved — choose one");
       const threadId = await spawnThread(bb, result.projectId, result.prompt);
+      await recordDispatch(bb, {
+        threadId,
+        request,
+        projectName: result.projectName,
+        createdAt: new Date().toISOString(),
+      });
       return { ...result, threadId };
     },
+    history: async () =>
+      (await bb.storage.kv.get<z.infer<typeof dispatchRecord>[]>(DISPATCH_HISTORY_KEY)) ?? [],
   });
 
   bb.cli.register({
@@ -604,6 +635,12 @@ export default async function plugin(bb: BbPluginApi) {
         return { exitCode: 1, stdout: header, stderr: "\nno project resolved; pass --project <id>" };
       }
       const threadId = await spawnThread(bb, result.projectId, result.prompt);
+      await recordDispatch(bb, {
+        threadId,
+        request,
+        projectName: result.projectName,
+        createdAt: new Date().toISOString(),
+      });
       return { exitCode: 0, stdout: `${header}\n\nspawned: ${threadId}` };
     },
   });
