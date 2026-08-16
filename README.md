@@ -16,6 +16,12 @@ bb dispatch "..." --project proj_abc123 --raw --go    # skip both intake steps
 Or the **Dispatch** entry in the sidebar, which does the same thing and drops
 you into the new thread.
 
+## Screenshots
+
+![dispatch](docs/screenshot.png)
+
+*Dispatch: turn a one-liner into a scoped thread in the right project.*
+
 ## How it works
 
 1. **Classify** — asks a model which of your registered bb projects the request
