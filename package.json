@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-dispatch",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "A bb plugin that turns a one-liner into a scoped thread in the right project: it classifies which of your bb projects the request belongs to, expands it through a prompt enhancer, and spawns the thread.",
   "keywords": [
