@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-dispatch",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "A bb plugin that turns a one-liner into a scoped thread in the right project: it classifies which of your bb projects the request belongs to, expands it through a prompt enhancer, and spawns the thread.",
   "keywords": [
@@ -36,7 +36,7 @@
     "name": "Dispatch",
     "description": "Expand a one-liner and route it to the right project as a new thread.",
     "branding": {
-      "icon": "Send"
+      "icon": "./assets/icon.svg"
     },
     "server": "./server.ts",
     "app": "./app.tsx"
@@ -56,6 +56,7 @@
   "files": [
     "dist",
     "server.ts",
-    "app.tsx"
+    "app.tsx",
+    "assets/icon.svg"
   ]
 }
